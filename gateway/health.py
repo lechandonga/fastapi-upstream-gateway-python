@@ -40,6 +40,8 @@ class HealthChecker:
 
     async def check_once(self) -> None:
         for node in self._registry.all():
+            if node.draining:
+                continue
             await self._probe(node)
 
     async def _probe(self, node: UpstreamNode) -> None:

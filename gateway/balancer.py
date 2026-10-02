@@ -73,11 +73,4 @@ class Balancer:
             return node
 
     async def release(self, node: UpstreamNode) -> None:
-        async with self._registry.lock:
-            node.in_flight = max(0, node.in_flight - 1)
-            logger.info(
-                "release node=%s strategy=%s in_flight=%d",
-                node.name,
-                self._strategy.name,
-                node.in_flight,
-            )
+        await self._registry.release(node)

@@ -2,10 +2,12 @@ import socket
 import threading
 import time
 
+import anyio
 import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
 from gateway.app import create_app
 from gateway.config import GatewayConfig
@@ -45,6 +47,7 @@ def make_fake_upstream(name: str, delay: float = 0.0) -> FastAPI:
     app.state.healthy = True
     app.state.delay = delay
     app.state.hits = {}
+    app.state.slow_stream_gate = anyio.Event()
 
     def count(path: str):
         app.state.hits[path] = app.state.hits.get(path, 0) + 1
@@ -84,6 +87,112 @@ def make_fake_upstream(name: str, delay: float = 0.0) -> FastAPI:
         from fastapi.responses import JSONResponse
 
         return JSONResponse(status_code=500, content={"detail": "boom"})
+
+    @app.get("/big")
+    async def big():
+        count("/big")
+        total = 512 * 1024
+
+        def gen():
+            chunk = b"x" * 64 * 1024
+            sent = 0
+            while sent < total:
+                yield chunk
+                sent += len(chunk)
+
+        return StreamingResponse(gen(), media_type="application/octet-stream")
+
+    @app.get("/gzip-me")
+    async def gzip_me():
+        count("/gzip-me")
+        import gzip
+
+        payload = ("gateway-gzip-payload-" * 4096).encode()
+        return Response(
+            content=gzip.compress(payload),
+            media_type="text/plain",
+            headers={"content-encoding": "gzip", "x-upstream-tag": "kept"},
+        )
+
+    @app.get("/chunked")
+    async def chunked():
+        count("/chunked")
+
+        async def gen():
+            for i in range(10):
+                yield f"chunk-{i}\n".encode()
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    @app.get("/slow-stream")
+    async def slow_stream():
+        count("/slow-stream")
+
+        async def gen():
+            yield b"first\n"
+            await app.state.slow_stream_gate.wait()
+            yield b"second\n"
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    @app.get("/slow-start")
+    async def slow_start():
+        count("/slow-start")
+        await app.state.slow_stream_gate.wait()
+        return PlainTextResponse("done")
+
+    @app.post("/release-slow-stream")
+    async def release_slow_stream():
+        app.state.slow_stream_gate.set()
+        return {"released": True}
+
+    @app.get("/headers-debug")
+    async def headers_debug(request: Request):
+        count("/headers-debug")
+        return {"headers": dict(request.headers)}
+
+    @app.get("/internal-response")
+    async def internal_response():
+        count("/internal-response")
+        return PlainTextResponse(
+            "ok",
+            headers={
+                "x-internal-only": "secret",
+                "x-public-tag": "visible",
+                "set-cookie": "a=1",
+            },
+        )
+
+    @app.get("/hop-response")
+    async def hop_response():
+        count("/hop-response")
+        return PlainTextResponse(
+            "hop-body",
+            headers={
+                "connection": "x-up-hop, keep-alive",
+                "x-up-hop": "should-be-stripped",
+                "x-safe-resp": "kept",
+            },
+        )
+
+    @app.get("/steady-stream")
+    async def steady_stream(request: Request):
+        count("/steady-stream")
+        duration = float(request.query_params.get("duration", "1"))
+        interval = float(request.query_params.get("interval", "0.05"))
+
+        async def gen():
+            import asyncio
+
+            elapsed = 0.0
+            i = 0
+            while elapsed < duration:
+                await asyncio.sleep(interval)
+                yield f"{i}\n".encode()
+                elapsed += interval
+                i += 1
+
+        return StreamingResponse(gen(), media_type="text/plain")
 
     return app
 

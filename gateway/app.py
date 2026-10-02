@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from .balancer import Balancer
 from .config import GatewayConfig
-from .errors import NodeAlreadyExistsError, NodeNotFoundError
+from .errors import NodeAlreadyExistsError, NodeDrainingError, NodeNotFoundError
 from .health import HealthChecker
 from .proxy import ProxyHandler
 from .registry import NodeRegistry
@@ -51,6 +51,12 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             status_code=404, content={"error": "node_not_found", "detail": str(exc)}
         )
 
+    @app.exception_handler(NodeDrainingError)
+    async def draining_handler(request: Request, exc: NodeDrainingError):
+        return JSONResponse(
+            status_code=409, content={"error": "node_draining", "detail": str(exc)}
+        )
+
     @app.get("/")
     def read_root():
         return {"Hello": "World"}
@@ -63,7 +69,14 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     @app.delete("/admin/upstreams/{name}")
     async def unregister_upstream(name: str):
         node = await registry.unregister(name)
-        return node.snapshot()
+        snapshot = node.snapshot()
+        if node.draining:
+            # still serving in-flight requests; removed from the pool already
+            return JSONResponse(
+                status_code=202,
+                content={**snapshot, "message": "node is draining, no new requests accepted"},
+            )
+        return JSONResponse(status_code=200, content=snapshot)
 
     @app.get("/admin/upstreams")
     async def list_upstreams():
