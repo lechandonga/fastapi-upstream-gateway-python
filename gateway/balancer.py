@@ -81,3 +81,6 @@ class Balancer:
                 self._strategy.name,
                 node.in_flight,
             )
+            if node.draining and node.in_flight == 0:
+                node.drained_event.set()
+                logger.info("node=%s drained: all in-flight requests finished", node.name)

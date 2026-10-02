@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -7,7 +8,7 @@ from pydantic import BaseModel
 
 from .balancer import Balancer
 from .config import GatewayConfig
-from .errors import NodeAlreadyExistsError, NodeNotFoundError
+from .errors import NodeAlreadyExistsError, NodeDrainingError, NodeNotFoundError
 from .health import HealthChecker
 from .proxy import ProxyHandler
 from .registry import NodeRegistry
@@ -51,6 +52,12 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             status_code=404, content={"error": "node_not_found", "detail": str(exc)}
         )
 
+    @app.exception_handler(NodeDrainingError)
+    async def draining_handler(request: Request, exc: NodeDrainingError):
+        return JSONResponse(
+            status_code=409, content={"error": "node_draining", "detail": str(exc)}
+        )
+
     @app.get("/")
     def read_root():
         return {"Hello": "World"}
@@ -62,8 +69,29 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
 
     @app.delete("/admin/upstreams/{name}")
     async def unregister_upstream(name: str):
-        node = await registry.unregister(name)
-        return node.snapshot()
+        node, already_draining = await registry.begin_drain(name)
+        if already_draining:
+            raise NodeDrainingError(
+                f"upstream node {name!r} is already draining "
+                f"({node.in_flight} in-flight request(s) remaining)"
+            )
+
+        async def drain_and_remove() -> None:
+            await node.drained_event.wait()
+            await registry.finish_drain(name)
+
+        if node.in_flight == 0:
+            # No traffic: preserve the previous immediate-removal behaviour,
+            # including the guarantee that a follow-up DELETE already 404s.
+            await registry.finish_drain(name)
+            return JSONResponse(status_code=200, content=node.snapshot())
+
+        # In-flight requests exist: the node is already out of the
+        # selectable pool and gets removed in the background once they
+        # finish. Reaching this line without awaiting anything means no
+        # request can complete between begin_drain and this branch.
+        asyncio.create_task(drain_and_remove())
+        return JSONResponse(status_code=202, content=node.snapshot())
 
     @app.get("/admin/upstreams")
     async def list_upstreams():
