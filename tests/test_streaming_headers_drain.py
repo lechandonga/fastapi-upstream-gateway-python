@@ -3,6 +3,7 @@ import threading
 import time
 
 import httpx
+import pytest
 
 from gateway.config import GatewayConfig
 
@@ -123,12 +124,19 @@ def test_stream_idle_timeout_aborts_stalled_upstream(client, gateway, upstream_f
     up = upstream_factory("a")
     register(client, gw, "a", up.url)
 
+    # The upstream already sent one body chunk and then goes quiet longer
+    # than the idle timeout. The client must NOT see a cleanly finished
+    # response: the body is aborted at the transport level so partial data
+    # is distinguishable from a successful full transfer.
     start = time.monotonic()
-    resp = client.get(f"{gw.url}/slow-stream")
-    elapsed = time.monotonic() - start
-    assert resp.status_code == 200
-    assert resp.content == b"first\n"
-    assert elapsed < 3  # bounded by the idle gap, not by hanging forever
+    with pytest.raises(httpx.HTTPError):
+        with client.stream("GET", f"{gw.url}/slow-stream") as resp:
+            assert resp.status_code == 200
+            chunks = resp.iter_bytes()
+            assert next(chunks) == b"first\n"
+            for _ in chunks:
+                pass
+    assert time.monotonic() - start < 3  # bounded by the idle gap, not hanging
     assert node_state(client, gw, "a")["in_flight"] == 0
 
 
@@ -157,7 +165,12 @@ def test_client_disconnect_mid_stream_does_not_leak(client, gateway, upstream_fa
 
     short = httpx.Client(timeout=10)
     with short.stream("GET", f"{gw.url}/slow-stream") as resp:
-        first = next(resp.iter_bytes())
+        # Keep ONE iterator for the whole stream: creating a fresh iterator
+        # per read (next(resp.iter_bytes())) lets the previous one be GC'd
+        # mid-response, which httpcore interprets as "consumer aborted" and
+        # closes the socket -- that would test the client, not the gateway.
+        chunks = resp.iter_bytes()
+        first = next(chunks)
         assert first == b"first\n"
         state = node_state(client, gw, "a")
         assert state["in_flight"] == 1

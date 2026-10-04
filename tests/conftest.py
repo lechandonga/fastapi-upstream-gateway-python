@@ -1,3 +1,4 @@
+import asyncio
 import socket
 import threading
 import time
@@ -48,6 +49,7 @@ def make_fake_upstream(name: str, delay: float = 0.0) -> FastAPI:
     app.state.delay = delay
     app.state.hits = {}
     app.state.slow_stream_gate = anyio.Event()
+    app.state.headers_stall = False
 
     def count(path: str):
         app.state.hits[path] = app.state.hits.get(path, 0) + 1
@@ -140,6 +142,22 @@ def make_fake_upstream(name: str, delay: float = 0.0) -> FastAPI:
         count("/slow-start")
         await app.state.slow_stream_gate.wait()
         return PlainTextResponse("done")
+
+    @app.get("/stall-headers")
+    async def stall_headers():
+        count("/stall-headers")
+
+        if not app.state.headers_stall:
+            return PlainTextResponse("complete-body-from-" + app.state.name)
+
+        async def gen():
+            # The generator never yields: uvicorn has already sent the
+            # response status/headers when the first iteration suspends,
+            # but no body byte is ever produced (until the process stops).
+            await asyncio.Event().wait()
+            yield b"unreachable"  # pragma: no cover
+
+        return StreamingResponse(gen(), media_type="text/plain")
 
     @app.post("/release-slow-stream")
     async def release_slow_stream():

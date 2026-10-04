@@ -76,10 +76,32 @@ uv run uvicorn main:app --port 8000
 
 超时规则（与普通请求区分）：
 
-- 建连与等待响应头仍受 `GATEWAY_REQUEST_TIMEOUT` 约束；
-- body 阶段采用**数据空闲超时** `GATEWAY_STREAM_IDLE_TIMEOUT`
-  （未配置时回退为 `GATEWAY_REQUEST_TIMEOUT`）：上游超过该时长一个字节都不出，
-  流被中断；只要上游在持续出数据，传输总时长可以远超普通请求超时，不会被打断。
+- 建连与等待响应头受 `GATEWAY_REQUEST_TIMEOUT` 约束；
+- body 阶段**只看数据空闲、不看总时长**：数据空闲超时为
+  `GATEWAY_STREAM_IDLE_TIMEOUT`（未配置时回退为 `GATEWAY_REQUEST_TIMEOUT`）。
+  上游连续两次读到数据的间隔超过它才中断；只要上游在持续出数据，
+  传输总时长可以任意长，永远不会因为“总时长超过普通请求超时”被打断。
+  大响应、gzip/br/zstd 压缩响应、上游分块响应都走同一条读取路径，语义一致。
+
+上游异常时的处理（关键：客户端绝不可能拿到一个“看起来成功、内容却不全”的响应）：
+
+- **响应提交点**：网关在收到上游**第一个 body 字节**（或干净的空 body 结束）之前，
+  不会向客户端发送任何响应头或状态码。
+- 上游**回完响应头后迟迟不出数据**（卡住）、在第一个 body 字节之前**报错或断连**：
+  该次尝试被释放，对幂等方法按重试策略**换另一个健康节点重取**，
+  客户端只会看到最终那个完整响应；所有可用节点都失败时返回明确的失败结果
+  （`504 upstream_timeout` / `502 upstream_broken_response` / `503 no_healthy_upstream`），
+  不会返回空 body 的 200。
+- 上游在**已经传出部分 body 之后**停滞超过空闲超时、中途报错或连接被截断：
+  此时响应头和部分数据已经发给客户端，HTTP 无法再改状态码或透明重试，
+  网关直接在传输层中断响应（不发送正常的结束标记）。客户端会收到一个
+  可识别的传输错误（如 httpx 的 `ReadTimeout` / `RemoteProtocolError`），
+  从而能明确判定“内容不完整、本次失败”，而不是把残缺内容当成一次成功的 200。
+  非幂等方法以及没有其它健康节点的请求同理，不会伪造成功。
+- **客户端中途断开**：ASGI 层取消响应任务后，网关立即关闭到上游的连接并释放该节点的
+  在途计数，不会傻等到上游空闲超时，也不泄漏连接；只要客户端还能正常收数据，
+  在途计数就一直占着。配合优雅下线时，仍在传 body 的节点保持 `draining`、
+  不会被提前摘除，直到该在途请求随客户端断开或传完而结束。
 
 在途计数与连接生命周期：
 
@@ -130,8 +152,11 @@ uv run uvicorn main:app --port 8000
 - 失败归一为可区分的响应：
   - 上游超时 → `504 {"error": "upstream_timeout"}`
   - 连接失败 → `502 {"error": "upstream_connect_error"}`
+  - 上游在第一个 body 字节之前就断连/响应损坏 → `502 {"error": "upstream_broken_response"}`
   - 上游返回 5xx → `502 {"error": "upstream_server_error"}`（detail 含上游状态码）
   - 无健康节点 → `503 {"error": "no_healthy_upstream"}`
+  - 已提交（部分 body 已发出）之后上游失败无法用状态码表达，改为在传输层中断，
+    客户端收到可识别的传输错误，详见“流式 / 大响应 / 上游压缩”一节。
 - 头处理策略见“请求头 / 响应头策略”一节；转发时补齐 `X-Forwarded-For/Host/Proto`。
 
 ## 可配置项（环境变量）
@@ -167,8 +192,12 @@ uv run pytest            # 日志中会打印节点选择过程与健康状态�
 - 大响应（512KB 分块流式）逐字节正确、压缩响应（gzip）与直连上游报文一致、
   chunked 响应正确重组；
 - 首块数据提前到达（不必等整个响应）、传输期间在途计数占用与结束后回落；
-- 上游持续出数据时总时长超过普通超时也不被打断；上游迟迟不出数据时按空闲超时中断；
-- 客户端读到一半断开，在途计数最终回落、无泄漏；
+- 上游持续出数据时总时长超过普通超时也不被打断；上游回完头不出数据且另有健康节点时
+  自动换节点拿到完整内容，没有可用节点时返回明确的 `504` 而不是空 200；
+- 上游传到一半截断/出错时客户端收到可识别的传输错误而非残缺 200，
+  在途计数随之回落、无泄漏；
+- 客户端读到一半断开，在途计数立即回落、连接与计数不泄漏
+  （用同一迭代器持续读取，真实模拟未放弃的客户端；用例连续多轮稳定不抖动）；
 - 配置的禁传请求头/响应头剔除，`Connection` 点名的双向逐跳头剔除，转发头仍补齐；
 - 优雅下线：无在途立即移除（`200`）、有在途返回 `202` 且 `state=draining`/剩余在途可见、
   在途完成后自动移除、下线中不接新请求、重复注销 `409 node_draining`、
@@ -184,3 +213,16 @@ curl -X POST localhost:8000/admin/upstreams -H 'content-type: application/json' 
 curl localhost:8000/admin/upstreams           # 查看健康状态与 last_reason
 curl localhost:8000/some/path                 # 转发到上游
 ```
+
+流式失败语义可用内置假上游端点复现（测试用 uvicorn 假上游，见 `tests/conftest.py`）：
+
+- `GET /stall-headers`：正常时返回完整 body；把假上游 `app.state.headers_stall = True`
+  后，只回响应头、永不返回 body。注册一个 stall 节点加一个健康节点，
+  请求应拿到健康节点的完整内容；只注册 stall 节点时应得到 `504`，而不是空 200。
+- `GET /slow-stream`：先吐一块 `first\n`，之后挂住直到 `POST /release-slow-stream`
+  放行，用于观察在途计数占用/回落、空闲超时中断和优雅下线。
+- `GET /steady-stream?duration=1.2&interval=0.05`：持续小批量出数据，
+  把 `GATEWAY_REQUEST_TIMEOUT` 调到远小于总时长，验证流不被总时长打断。
+- 客户端读到一半主动关闭连接，再查 `GET /admin/upstreams`，
+  `in_flight` 应很快回落到 0；先 `DELETE /admin/upstreams/{name}` 进入优雅下线时，
+  在 body 传完前节点保持 `draining` 不会消失。
