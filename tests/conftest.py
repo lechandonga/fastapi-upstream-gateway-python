@@ -1,3 +1,4 @@
+import asyncio
 import socket
 import threading
 import time
@@ -48,6 +49,10 @@ def make_fake_upstream(name: str, delay: float = 0.0) -> FastAPI:
     app.state.delay = delay
     app.state.hits = {}
     app.state.slow_stream_gate = anyio.Event()
+    app.state.header_stall_gate = anyio.Event()
+    app.state.header_stalls = False
+    app.state.half_errors = False
+    app.state.fail_before_byte = False
 
     def count(path: str):
         app.state.hits[path] = app.state.hits.get(path, 0) + 1
@@ -140,6 +145,52 @@ def make_fake_upstream(name: str, delay: float = 0.0) -> FastAPI:
         count("/slow-start")
         await app.state.slow_stream_gate.wait()
         return PlainTextResponse("done")
+
+    @app.get("/stall-headers")
+    async def stall_headers():
+        # Nodes flagged header_stalls flush response headers and never produce
+        # body bytes until the gate is released; other nodes answer normally
+        # so the gateway can retry and serve the complete content.
+        count("/stall-headers")
+        if not app.state.header_stalls:
+            return PlainTextResponse("complete-body\n")
+
+        async def gen():
+            await app.state.header_stall_gate.wait()
+            yield b"finally\n"
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    @app.post("/release-header-stall")
+    async def release_header_stall():
+        app.state.header_stall_gate.set()
+        return {"released": True}
+
+    @app.get("/half-then-error")
+    async def half_then_error():
+        # Flagged nodes send a few real chunks then die mid-body: the
+        # connection ends without a terminating chunk, so the client must see
+        # a broken stream instead of a clean (truncated) 200.
+        count("/half-then-error")
+        if not app.state.half_errors:
+            return PlainTextResponse("complete-body\n")
+
+        async def gen():
+            if app.state.fail_before_byte:
+                await asyncio.sleep(0.05)
+                raise RuntimeError("upstream died before first byte")
+            yield b"part-0\n"
+            await asyncio.sleep(0.1)
+            yield b"part-1\n"
+            await asyncio.sleep(0.1)
+            raise RuntimeError("upstream exploded mid-body")
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    @app.get("/full")
+    async def full():
+        count("/full")
+        return PlainTextResponse("complete-body\n")
 
     @app.post("/release-slow-stream")
     async def release_slow_stream():

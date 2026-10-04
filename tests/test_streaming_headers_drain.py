@@ -3,6 +3,7 @@ import threading
 import time
 
 import httpx
+import pytest
 
 from gateway.config import GatewayConfig
 
@@ -118,18 +119,74 @@ def test_first_byte_arrives_before_full_body(client, gateway, upstream_factory):
     assert node_state(client, gw, "a")["in_flight"] == 0
 
 
-def test_stream_idle_timeout_aborts_stalled_upstream(client, gateway, upstream_factory):
-    gw = gateway(gw_config(stream_idle_timeout=0.3))
-    up = upstream_factory("a")
-    register(client, gw, "a", up.url)
+def test_headers_back_but_no_body_stalled_node_is_retried_elsewhere(
+    client, gateway, upstream_factory
+):
+    # Scenario: the bad upstream returns response headers but never produces
+    # body bytes. Because nothing has been committed to the client yet, the
+    # gateway must transparently try a healthy node and serve the full body.
+    gw = gateway(gw_config(request_timeout=0.3, stream_idle_timeout=0.3, max_retries=1))
+    bad = upstream_factory("bad")
+    good = upstream_factory("good")
+    register(client, gw, "bad", bad.url)
+    register(client, gw, "good", good.url)
+
+    bad._server.config.app.state.header_stalls = True
 
     start = time.monotonic()
-    resp = client.get(f"{gw.url}/slow-stream")
+    resp = client.get(f"{gw.url}/stall-headers")
     elapsed = time.monotonic() - start
+
     assert resp.status_code == 200
-    assert resp.content == b"first\n"
+    assert resp.text == "complete-body\n"
+    assert bad._server.config.app.state.hits.get("/stall-headers", 0) == 1
+    assert good._server.config.app.state.hits.get("/stall-headers", 0) == 1
     assert elapsed < 3  # bounded by the idle gap, not by hanging forever
-    assert node_state(client, gw, "a")["in_flight"] == 0
+    assert node_state(client, gw, "bad")["in_flight"] == 0
+    assert node_state(client, gw, "good")["in_flight"] == 0
+
+
+def test_headers_back_but_no_body_without_spare_node_returns_clear_failure(
+    client, gateway, upstream_factory
+):
+    # Scenario: same stall, but no other healthy node / retries left.  The
+    # client must get an explicit failure (504 JSON), never an empty 200.
+    gw = gateway(gw_config(request_timeout=0.3, stream_idle_timeout=0.3, max_retries=0))
+    bad = upstream_factory("bad")
+    register(client, gw, "bad", bad.url)
+    bad._server.config.app.state.header_stalls = True
+
+    start = time.monotonic()
+    resp = client.get(f"{gw.url}/stall-headers")
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 504
+    assert resp.json()["error"] == "upstream_timeout"
+    assert resp.content  # non-empty JSON body, no empty 200
+    assert elapsed < 3
+    assert node_state(client, gw, "bad")["in_flight"] == 0
+
+
+def test_headers_back_but_no_body_retries_exhausted_returns_clear_failure(
+    client, gateway, upstream_factory
+):
+    # Every node stalls after headers: after trying distinct nodes, the
+    # gateway must still answer 504 rather than a truncated 200.
+    gw = gateway(gw_config(request_timeout=0.3, stream_idle_timeout=0.3, max_retries=1))
+    bad1 = upstream_factory("bad1")
+    bad2 = upstream_factory("bad2")
+    register(client, gw, "bad1", bad1.url)
+    register(client, gw, "bad2", bad2.url)
+    bad1._server.config.app.state.header_stalls = True
+    bad2._server.config.app.state.header_stalls = True
+
+    resp = client.get(f"{gw.url}/stall-headers")
+    assert resp.status_code == 504
+    assert resp.json()["error"] == "upstream_timeout"
+    assert bad1._server.config.app.state.hits.get("/stall-headers", 0) == 1
+    assert bad2._server.config.app.state.hits.get("/stall-headers", 0) == 1
+    for name in ("bad1", "bad2"):
+        assert node_state(client, gw, name)["in_flight"] == 0
 
 
 def test_continuously_streaming_body_not_cut_by_total_duration(
@@ -150,24 +207,120 @@ def test_continuously_streaming_body_not_cut_by_total_duration(
     assert node_state(client, gw, "a")["in_flight"] == 0
 
 
-def test_client_disconnect_mid_stream_does_not_leak(client, gateway, upstream_factory):
-    gw = gateway(gw_config(stream_idle_timeout=10.0, request_timeout=10.0))
+def test_upstream_dies_mid_body_is_not_a_clean_truncated_200(
+    client, gateway, upstream_factory
+):
+    # Scenario: upstream sends a 200 and part of the body, then its task
+    # dies / the connection drops. After commit the gateway cannot swap
+    # status anymore; it must abort the framing so the client observes an
+    # interrupted transfer -- never a clean, short "successful" 200.
+    gw = gateway(gw_config(stream_idle_timeout=10.0, request_timeout=10.0, max_retries=1))
+    bad = upstream_factory("bad")
+    register(client, gw, "bad", bad.url)
+    bad._server.config.app.state.half_errors = True
+
+    chunks = []
+    with pytest.raises((httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout)):
+        with client.stream("GET", f"{gw.url}/half-then-error") as resp:
+            assert resp.status_code == 200
+            for chunk in resp.iter_bytes():
+                chunks.append(chunk)
+
+    received = b"".join(chunks)
+    assert b"part-0" in received  # real data got through...
+    assert received.count(b"part-") < 100  # ...but the stream did not "end"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and node_state(client, gw, "bad")["in_flight"]:
+        time.sleep(0.02)
+    assert node_state(client, gw, "bad")["in_flight"] == 0
+
+
+def test_upstream_dies_before_first_byte_is_retried_elsewhere(
+    client, gateway, upstream_factory
+):
+    # Upstream drops/errors after headers but before any body byte: nothing
+    # is committed, so a healthy node transparently supplies the full body.
+    gw = gateway(gw_config(request_timeout=2.0, stream_idle_timeout=2.0, max_retries=1))
+    bad = upstream_factory("bad")
+    good = upstream_factory("good")
+    register(client, gw, "bad", bad.url)
+    register(client, gw, "good", good.url)
+    bad._server.config.app.state.half_errors = True
+    bad._server.config.app.state.fail_before_byte = True
+
+    resp = client.get(f"{gw.url}/half-then-error")
+    assert resp.status_code == 200
+    assert resp.text == "complete-body\n"
+    assert bad._server.config.app.state.hits.get("/half-then-error", 0) == 1
+    assert good._server.config.app.state.hits.get("/half-then-error", 0) == 1
+    assert node_state(client, gw, "bad")["in_flight"] == 0
+    assert node_state(client, gw, "good")["in_flight"] == 0
+
+
+def test_upstream_dies_before_first_byte_without_spare_is_clear_failure(
+    client, gateway, upstream_factory
+):
+    # Same failure, but retries are disabled: no spare attempt means an
+    # explicit 502 rather than an empty 200.
+    gw = gateway(gw_config(request_timeout=2.0, stream_idle_timeout=2.0, max_retries=0))
+    bad = upstream_factory("bad")
+    register(client, gw, "bad", bad.url)
+    bad._server.config.app.state.half_errors = True
+    bad._server.config.app.state.fail_before_byte = True
+
+    resp = client.get(f"{gw.url}/half-then-error")
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "upstream_stream_error"
+    assert resp.content
+    assert node_state(client, gw, "bad")["in_flight"] == 0
+
+
+@pytest.mark.parametrize("run", range(5))
+def test_client_disconnect_mid_stream_counter_drops_deterministically(
+    client, gateway, upstream_factory, run
+):
+    # Same scenario repeated: while the client is still reading and waiting
+    # for more data, in_flight must stay held; right after the client aborts
+    # it must fall back to 0 promptly, every single time.
+    gw = gateway(gw_config(stream_idle_timeout=30.0, request_timeout=30.0))
     up = upstream_factory("a")
     register(client, gw, "a", up.url)
 
-    short = httpx.Client(timeout=10)
-    with short.stream("GET", f"{gw.url}/slow-stream") as resp:
-        first = next(resp.iter_bytes())
-        assert first == b"first\n"
-        state = node_state(client, gw, "a")
-        assert state["in_flight"] == 1
-    short.close()  # explicit client abort while upstream is still holding back
+    got_first = threading.Event()
+    abort = threading.Event()
+
+    def consume():
+        with httpx.Client(timeout=10) as local:
+            with local.stream("GET", f"{gw.url}/slow-stream") as resp:
+                iterator = resp.iter_bytes()
+                assert next(iterator) == b"first\n"
+                got_first.set()
+                abort.wait(10)  # keep the connection actively open
+                local.close()  # explicit client abort while upstream holds
+
+    t = threading.Thread(target=consume, daemon=True)
+    t.start()
+    assert got_first.wait(5)
+
+    # the stream is still open and more data may arrive: counter stays held
+    for _ in range(10):
+        time.sleep(0.05)
+        assert node_state(client, gw, "a")["in_flight"] == 1
+
+    abort.set()
+    t.join(timeout=5)
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if node_state(client, gw, "a")["in_flight"] == 0:
             break
-        time.sleep(0.05)
+        time.sleep(0.02)
+    assert node_state(client, gw, "a")["in_flight"] == 0
+
+    # the node stays usable for new requests and is not stuck draining
+    followup = client.get(f"{gw.url}/echo")
+    assert followup.status_code == 200
+    assert followup.json()["node"] == "a"
     assert node_state(client, gw, "a")["in_flight"] == 0
 
 
